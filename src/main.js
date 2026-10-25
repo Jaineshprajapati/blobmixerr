@@ -102,6 +102,24 @@ let lockedUntil = 0;
 let started = false;
 let gui = null;
 
+// How hard the user is scrolling right now (0..1.6). Every wheel tick / swipe adds to it and it
+// fades out within a second, so a gentle scroll gives a gentle ripple and a hard one a big swell.
+let scrollEnergy = 0;
+const addEnergy = (n) => { scrollEnergy = Math.min(1.6, scrollEnergy + n); };
+const waveEnv = { v: 0 };   // 0 -> 1 -> 0 envelope of each transition (the long tail is the water settling)
+let waveDir = 1;            // smoothed scroll direction, so waves never jump when you reverse
+let activeIndex = currentIndex; // the title in the centre; only this one breathes
+const breath = blobs.map(() => 0); // per-title breathing weight (eases to 1 for the active title)
+
+// Horizontal float: the blob drifts a few pixels sideways with the scroll, then glides back to the centre.
+const DRIFT_MAX = 0.2;  // furthest it may drift, in world units (about 30px on a laptop screen)
+const DRIFT_SIGN = -1;  // -1: the blob moves WITH the content (scroll forward -> drifts left). Set 1 to reverse.
+const drift = { x: 0, vx: 0, target: 0, hold: 0, dragging: false };
+const nudgeDrift = (n) => {
+  if (reduceMotion) return;
+  drift.target = THREE.MathUtils.clamp(drift.target + n, -DRIFT_MAX, DRIFT_MAX);
+};
+
 const loadingManager = new THREE.LoadingManager();
 const textureLoader = new THREE.TextureLoader(loadingManager);
 const rgbeLoader = new RGBELoader(loadingManager);
@@ -254,7 +272,7 @@ const relOf = (i, cur) => {
 };
 
 // progress/direction are shared so every title twirls together; opacity is per title
-const textUniforms = { progress: { value: 0 }, direction: { value: 1 } };
+const textUniforms = { progress: { value: 0 }, direction: { value: 1 }, uWave: { value: 0 }, uPhase: { value: 0 } };
 const makeTextMaterial = () => new THREE.ShaderMaterial({
   vertexShader: textVertex,
   fragmentShader: `uniform float uOpacity; void main() { gl_FragColor = vec4(vec3(1.0), uOpacity); }`,
@@ -264,6 +282,8 @@ const makeTextMaterial = () => new THREE.ShaderMaterial({
   uniforms: {
     progress: textUniforms.progress,
     direction: textUniforms.direction,
+    uWave: textUniforms.uWave,
+    uPhase: textUniforms.uPhase,
     uOpacity: { value: 0 },
   },
 });
@@ -349,6 +369,9 @@ style.textContent = `
   /* everything fades in very slowly once the scene is ready */
   .ui__fade { opacity: 0; transition: opacity 2.6s ease 0.5s, transform 2.6s cubic-bezier(.2,.7,.2,1) 0.5s; }
   .ui.is-ready .ui__fade { opacity: 1; transform: none; }
+  /* the badge moves every frame, so it must fade in with opacity ONLY: a transform
+     transition here would smooth its movement over seconds and make it feel laggy */
+  .ui__fade--opacity { transition: opacity 2.6s ease 0.5s; }
 
   .ui__nav { position: absolute; top: 28px; left: 32px; right: 32px;
     display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
@@ -362,16 +385,33 @@ style.textContent = `
   .ui__nav .ui__link:last-child { justify-self: end; }
   .ui__nav .ui__link:nth-child(2) { justify-self: center; }
 
+  .ui__right { justify-self: end; display: flex; align-items: center; gap: 28px; }
+  button.ui__link { background: none; border: 0; font: inherit; cursor: pointer; }
+  .ui__sound { display: inline-flex; align-items: center; gap: 8px; }
+  .ui__eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; }
+  .ui__eq i { width: 2px; height: 2px; background: currentColor; border-radius: 1px; }
+  .ui__sound.is-on .ui__eq i { animation: ui-eq 1.8s ease-in-out infinite; }
+  .ui__sound.is-on .ui__eq i:nth-child(2) { animation-delay: -0.6s; }
+  .ui__sound.is-on .ui__eq i:nth-child(3) { animation-delay: -1.2s; }
+  @keyframes ui-eq { 0%, 100% { height: 3px; } 50% { height: 11px; } }
+  @media (prefers-reduced-motion: reduce) { .ui__sound.is-on .ui__eq i { animation: none; height: 7px; } }
+
   .ui__progress { position: absolute; right: 32px; bottom: calc(34px + env(safe-area-inset-bottom, 0px)); width: 180px; height: 1px;
     background: rgba(255,255,255,0.28); }
   .ui__progress span { position: absolute; left: 0; top: 0; height: 100%; width: 0; background: #fff;
     transition: width 1.4s cubic-bezier(.4,0,.2,1); }
+
+  .ui__credit { position: absolute; left: 32px; bottom: calc(34px + env(safe-area-inset-bottom, 0px));
+  display: block; line-height: 1; }
 
   .ui__badge { position: absolute; left: 50%; bottom: calc(70px + env(safe-area-inset-bottom, 0px)); width: 124px; height: 124px;
     margin-left: -62px; pointer-events: auto; cursor: pointer; border-radius: 50%; will-change: transform; }
   .ui__badge:focus-visible { outline: 1px solid rgba(255,255,255,0.7); outline-offset: 4px; }
   .ui__ring { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; will-change: transform; }
   .ui__ring text { fill: currentColor; font-size: 15px; font-weight: 500; }
+  .ui__ripple { position: absolute; inset: 0; border-radius: 50%; border: 1px solid currentColor;
+    pointer-events: none; animation: ui-ripple 1.5s cubic-bezier(.2,.7,.2,1) forwards; }
+  @keyframes ui-ripple { from { transform: scale(0.7); opacity: 0.7; } to { transform: scale(1.9); opacity: 0; } }
   .ui__star { position: absolute; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px;
     fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linejoin: round; will-change: transform; }
 
@@ -385,7 +425,13 @@ style.textContent = `
     .ui { font-size: 14px; }
     .ui__nav { left: 20px; right: 20px; top: 20px; }
     .ui__progress { right: 20px; bottom: calc(28px + env(safe-area-inset-bottom, 0px)); width: 110px; }
+    .ui__credit { left: 20px; bottom: calc(28px + env(safe-area-inset-bottom, 0px)); }
     .ui__badge { width: 100px; height: 100px; margin-left: -50px; bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+  }
+
+  @media (max-width: 380px) {
+    .ui { font-size: 13px; }
+    .ui__right { gap: 14px; }
   }
 `;
 document.head.appendChild(style);
@@ -395,11 +441,17 @@ ui.className = 'ui';
 ui.innerHTML = `
   <nav class="ui__nav ui__fade">
     <a class="ui__link" href="#">${NAV.left}</a>
-    <a class="ui__link" href="#">${NAV.center}</a>
-    <a class="ui__link" href="#">${NAV.right}</a>
+    <a class="ui__link" href="https://www.behance.net/jainesh" target="_blank" rel="noopener noreferrer">${NAV.center}</a>
+    <div class="ui__right">
+      <button class="ui__link ui__sound" type="button" aria-pressed="false" aria-label="Turn sound on">
+        <span>Sound</span><span class="ui__eq" aria-hidden="true"><i></i><i></i><i></i></span>
+      </button>
+      <a class="ui__link" href="https://www.linkedin.com/in/jainesh-prajapati" target="_blank" rel="noopener noreferrer">${NAV.right}</a>
+    </div>
   </nav>
   <div class="ui__progress ui__fade"><span></span></div>
-  <div class="ui__badge ui__fade" role="button" tabindex="0" aria-label="Next blob">
+  <a class="ui__link ui__credit ui__fade" href="https://www.behance.net/jainesh" target="_blank" rel="noopener noreferrer">Made by Jainesh</a>
+  <div class="ui__badge ui__fade ui__fade--opacity" role="button" tabindex="0" aria-label="Next blob">
     <svg class="ui__ring" viewBox="0 0 200 200" aria-hidden="true">
       <defs><path id="badge-circle" d="M100,100 m-76,0 a76,76 0 1,1 152,0 a76,76 0 1,1 -152,0"/></defs>
       <text><textPath href="#badge-circle" textLength="476" lengthAdjust="spacing">${BADGE_TEXT}</textPath></text>
@@ -410,7 +462,12 @@ ui.innerHTML = `
   </div>
 `;
 document.body.appendChild(ui);
-ui.querySelectorAll('.ui__link').forEach((a) => a.addEventListener('click', (e) => e.preventDefault()));
+ui.querySelectorAll('a.ui__link').forEach((a) => {
+  // only stop the placeholder "#" link from jumping to the top; real links open normally
+  if (a.getAttribute('href') === '#') {
+    a.addEventListener('click', (e) => e.preventDefault());
+  }
+});
 
 const progressEl = ui.querySelector('.ui__progress span');
 const badge = ui.querySelector('.ui__badge');
@@ -422,44 +479,287 @@ function updateUI() {
 }
 updateUI();
 
-/* ---- Badge: ring turns slowly, whole badge drifts a little toward the cursor ---- */
+/* ---- Badge: a springy magnet that reacts to the cursor ----
+   Zone 1 (anywhere on screen): it drifts inside a small fixed box toward the cursor.
+   Zone 2 (inside MAGNET_RADIUS): it is pulled toward the cursor, harder the closer you get.
+   Flicking the cursor past it spins the ring, pressing squishes it, clicking sends a ripple. */
 
-const pointer = { x: 0, y: 0 };            // -1..1 across the screen
-const badgeState = { x: 0, y: 0, angle: 0, speed: 14, scale: 1, hover: false };
+const BADGE = {
+  AREA_X: 40, AREA_Y: 24,      // zone 1: how far it drifts in total across the screen (px)
+  MAGNET_RADIUS: 240,          // zone 2: distance (px) at which it starts chasing the cursor
+  PULL: 0.42,                  // zone 2: share of the cursor offset it follows at point-blank range
+  MAX_X: 90, MAX_Y: 60,        // hard limits, so it always stays inside its area
+  STIFFNESS: 20, DAMPING: 6.5, // spring feel: lower stiffness = lazier, lower damping = more wobble
+  SPIN: 14, SPIN_MAX: 240,     // resting spin and the fastest a flick can make it turn (deg/s)
+};
+
+const clamp = THREE.MathUtils.clamp;
+const pointer = { x: 0, y: 0, px: window.innerWidth / 2, py: window.innerHeight / 2 };
+const badgeRest = { x: window.innerWidth / 2, y: window.innerHeight - 130 }; // where it sits with no offset
+const badgeState = { x: 0, y: 0, vx: 0, vy: 0, angle: 0, spin: BADGE.SPIN, scale: 1, hover: false, press: false };
 
 window.addEventListener('pointermove', (e) => {
   pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
   pointer.y = (e.clientY / window.innerHeight) * 2 - 1;
+  pointer.px = e.clientX;
+  pointer.py = e.clientY;
+  if (reduceMotion) return;
+  // a flick near the badge kicks the ring around in the direction the cursor moved
+  if (Math.hypot(e.clientX - badgeRest.x, e.clientY - badgeRest.y) < BADGE.MAGNET_RADIUS) {
+    const kick = clamp(e.movementX || 0, -50, 50) * 0.9;
+    badgeState.spin = clamp(badgeState.spin + kick, -BADGE.SPIN_MAX, BADGE.SPIN_MAX);
+  }
 }, { passive: true });
 
 badge.addEventListener('pointerenter', () => { badgeState.hover = true; });
-badge.addEventListener('pointerleave', () => { badgeState.hover = false; });
-badge.addEventListener('click', () => step(1));
+badge.addEventListener('pointerleave', () => { badgeState.hover = false; badgeState.press = false; });
+badge.addEventListener('pointerdown', () => { badgeState.press = true; });
+window.addEventListener('pointerup', () => { badgeState.press = false; });
+
+function activateBadge() {
+  const r = document.createElement('span');
+  r.className = 'ui__ripple';
+  r.addEventListener('animationend', () => r.remove());
+  badge.appendChild(r);
+  addEnergy(0.5);
+  sound.blip(740);
+  step(1);
+}
+badge.addEventListener('click', activateBadge);
 badge.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); step(1); }
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activateBadge(); }
 });
 
 function updateBadge(dt) {
-  const MAX = 14; // px the badge may drift: a small, fixed area
-  const ease = 1 - Math.exp(-dt * 2.5); // low number = slow, soft follow
+  // where the badge would sit with no offset (measured, so it stays right on every screen)
+  const rect = badge.getBoundingClientRect();
+  badgeRest.x = rect.left + rect.width / 2 - badgeState.x;
+  badgeRest.y = rect.top + rect.height / 2 - badgeState.y;
 
-  const tx = reduceMotion ? 0 : pointer.x * MAX;
-  const ty = reduceMotion ? 0 : pointer.y * MAX * 0.6;
-  badgeState.x += (tx - badgeState.x) * ease;
-  badgeState.y += (ty - badgeState.y) * ease;
+  let tx = 0;
+  let ty = 0;
+  let near = 0;
+  if (!reduceMotion) {
+    tx = pointer.x * BADGE.AREA_X;
+    ty = pointer.y * BADGE.AREA_Y;
 
-  // ring: slow spin, a touch faster on hover
-  const targetSpeed = reduceMotion ? 0 : badgeState.hover ? 40 : 14;
-  badgeState.speed += (targetSpeed - badgeState.speed) * ease;
-  badgeState.angle = (badgeState.angle + badgeState.speed * dt) % 360;
+    const dx = pointer.px - badgeRest.x;
+    const dy = pointer.py - badgeRest.y;
+    const f = 1 - Math.hypot(dx, dy) / BADGE.MAGNET_RADIUS;
+    if (f > 0) {
+      near = f * f * (3 - 2 * f); // smoothstep: 0 at the edge of the zone, 1 right on top of it
+      tx += dx * BADGE.PULL * near;
+      ty += dy * BADGE.PULL * near;
+    }
+    tx = clamp(tx, -BADGE.MAX_X, BADGE.MAX_X);
+    ty = clamp(ty, -BADGE.MAX_Y, BADGE.MAX_Y);
+  }
 
-  badgeState.scale += ((badgeState.hover ? 1.18 : 1) - badgeState.scale) * ease;
+  // damped spring toward the target: this is what gives it the soft, slightly wobbly follow
+  badgeState.vx += ((tx - badgeState.x) * BADGE.STIFFNESS - badgeState.vx * BADGE.DAMPING) * dt;
+  badgeState.vy += ((ty - badgeState.y) * BADGE.STIFFNESS - badgeState.vy * BADGE.DAMPING) * dt;
+  badgeState.x += badgeState.vx * dt;
+  badgeState.y += badgeState.vy * dt;
 
+  // ring: turns faster the closer the cursor is; flicks (above) add a kick that eases back out
+  const restSpin = reduceMotion ? 0 : BADGE.SPIN + near * 22 + (badgeState.hover ? 26 : 0);
+  badgeState.spin += (restSpin - badgeState.spin) * (1 - Math.exp(-dt * 1.1));
+  badgeState.angle = (badgeState.angle + badgeState.spin * dt) % 360;
+
+  const targetScale = (badgeState.press ? 0.9 : 1) + near * 0.1 + (badgeState.hover ? 0.1 : 0);
+  badgeState.scale += (targetScale - badgeState.scale) * (1 - Math.exp(-dt * 8));
+
+  const tilt = reduceMotion ? 0 : clamp(badgeState.vx * 0.12, -28, 28); // star leans into the movement
   badge.style.transform = `translate(${badgeState.x.toFixed(2)}px, ${badgeState.y.toFixed(2)}px)`;
   ring.style.transform = `rotate(${badgeState.angle.toFixed(2)}deg)`;
-  // star drifts a bit further than the ring, so it feels like it floats inside it
   star.style.transform =
-    `translate(${(badgeState.x * 0.7).toFixed(2)}px, ${(badgeState.y * 0.7).toFixed(2)}px) scale(${badgeState.scale.toFixed(3)})`;
+    `translate(${(badgeState.x * 0.7).toFixed(2)}px, ${(badgeState.y * 0.7).toFixed(2)}px) rotate(${tilt.toFixed(2)}deg) scale(${badgeState.scale.toFixed(3)})`;
+}
+
+/* ----------------------------------- Sound --------------------------------- */
+/*  No audio files: the sweep is generated live with the Web Audio API.       */
+/*  A soft filtered-noise whoosh plays on every scroll / swipe / key transition: */
+/*  it rises going forward, falls going back, and gets longer and louder the    */
+/*  harder you scroll. There is no background sound.                           */
+/*  Off by default. Browsers only allow sound after a click/tap/key press.     */
+
+const SOUND = {
+  MASTER: 0.8,          // overall volume, 0..1
+  SWEEP_VOLUME: 0.2,    // sweep loudness for a normal scroll; harder scrolls are louder
+  SWEEP_SECONDS: 1.1,   // base length of the whoosh
+  SWEEP_LOW: 300,       // Hz: the sweep moves between these two pitches
+  SWEEP_HIGH: 2000,
+  REVERB_SECONDS: 3,    // length of the airy tail
+  FADE_SECONDS: 1.2,    // fade in / out when toggling
+};
+
+const sound = (() => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const st = { ctx: null, master: null, send: null, noise: null, on: false };
+
+  function impulse(ctx, seconds) {
+    const n = Math.floor(ctx.sampleRate * seconds);
+    const buf = ctx.createBuffer(2, n, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3);
+    }
+    return buf;
+  }
+
+  function build() {
+    const ctx = new AC();
+    const master = ctx.createGain();
+    master.gain.value = 0;
+    master.connect(ctx.destination);
+
+    // shared reverb: anything connected to `send` gets the airy tail
+    const conv = ctx.createConvolver();
+    conv.buffer = impulse(ctx, SOUND.REVERB_SECONDS);
+    const wet = ctx.createGain();
+    wet.gain.value = 0.55;
+    conv.connect(wet);
+    wet.connect(master);
+    const send = ctx.createGain();
+    send.connect(conv);
+
+    // one shared burst of white noise, reused by every sweep
+    const noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const nd = noise.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+
+    Object.assign(st, { ctx, master, send, noise });
+  }
+
+  function start() {
+    if (!AC) return;
+    if (!st.ctx) build();
+    st.on = true;
+    st.ctx.resume();
+    const now = st.ctx.currentTime;
+    st.master.gain.cancelScheduledValues(now);
+    st.master.gain.setTargetAtTime(SOUND.MASTER, now, SOUND.FADE_SECONDS / 3);
+  }
+
+  function stop() {
+    if (!st.ctx) return;
+    st.on = false;
+    const now = st.ctx.currentTime;
+    st.master.gain.cancelScheduledValues(now);
+    st.master.gain.setTargetAtTime(0, now, SOUND.FADE_SECONDS / 3);
+    setTimeout(() => { if (!st.on) st.ctx.suspend(); }, SOUND.FADE_SECONDS * 1000 + 300);
+  }
+
+  // The transition whoosh: forward = rising pitch, back = falling pitch
+  function sweep(direction, energy) {
+    if (!st.on) return;
+    const { ctx } = st;
+    const now = ctx.currentTime;
+    const e = Math.min(energy, 1.6);
+    const dur = SOUND.SWEEP_SECONDS + e * 0.7;
+    const peak = SOUND.SWEEP_VOLUME * (0.6 + e * 0.9);
+
+    const src = ctx.createBufferSource();
+    src.buffer = st.noise;
+    src.loop = true;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 1.2;
+    const from = direction > 0 ? SOUND.SWEEP_LOW : SOUND.SWEEP_HIGH;
+    const to = direction > 0 ? SOUND.SWEEP_HIGH : SOUND.SWEEP_LOW;
+    filter.frequency.setValueAtTime(from, now);
+    filter.frequency.exponentialRampToValueAtTime(to, now + dur);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(peak, now + dur * 0.35);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    src.connect(filter);
+    filter.connect(gain);
+    let out = gain;
+    if (ctx.createStereoPanner) { // sweeps across the speakers with the content
+      const pan = ctx.createStereoPanner();
+      pan.pan.setValueAtTime(0.45 * direction, now);
+      pan.pan.linearRampToValueAtTime(-0.45 * direction, now + dur);
+      gain.connect(pan);
+      out = pan;
+    }
+    out.connect(st.master);
+    out.connect(st.send);
+    src.start(now);
+    src.stop(now + dur + 0.1);
+  }
+
+  // A tiny soft "tick" for button presses
+  function blip(freq = 660) {
+    if (!st.on) return;
+    const { ctx } = st;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.05, now + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.45);
+    osc.connect(g);
+    g.connect(st.master);
+    g.connect(st.send);
+    osc.start(now);
+    osc.stop(now + 0.5);
+  }
+
+  function setMaster(v) { if (st.ctx && st.on) st.master.gain.setTargetAtTime(v, st.ctx.currentTime, 0.1); }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!st.ctx || !st.on) return;
+    if (document.hidden) st.ctx.suspend(); else st.ctx.resume();
+  });
+
+  return { supported: !!AC, start, stop, sweep, blip, setMaster };
+})();
+
+// ---- the nav toggle (remembers your choice) ----
+const soundBtn = ui.querySelector('.ui__sound');
+
+// Keep sound OFF by default (icon off), and only enable if toggled
+let soundWanted = false;
+
+// Only enable sound if user previously enabled it in localStorage AND THEN turn it on
+try {
+  const storedPref = localStorage.getItem('blob-sound');
+  if (storedPref === '1') {
+    soundWanted = true;
+  } else {
+    soundWanted = false;
+  }
+} catch (err) {
+  soundWanted = false;
+}
+
+function showSoundState() {
+  // Update the icon to match the soundWanted state, which is false by default unless user enabled it before
+  soundBtn.classList.toggle('is-on', soundWanted);
+  soundBtn.setAttribute('aria-pressed', String(soundWanted));
+  soundBtn.setAttribute('aria-label', soundWanted ? 'Turn sound off' : 'Turn sound on');
+}
+showSoundState();
+
+if (!sound.supported) soundBtn.hidden = true;
+
+soundBtn.addEventListener('click', () => {
+  soundWanted = !soundWanted;
+  try { localStorage.setItem('blob-sound', soundWanted ? '1' : '0'); } catch (err) { /* ignore */ }
+  showSoundState();
+  if (soundWanted) { sound.start(); sound.blip(880); } else sound.stop();
+});
+
+// If sound was on last time, the browser still needs one click / tap / key press before it will play
+if (soundWanted && sound.supported) {
+  const unlock = () => { if (soundWanted) sound.start(); };
+  ['pointerdown', 'keydown', 'touchend'].forEach((ev) => window.addEventListener(ev, unlock, { once: true }));
 }
 
 /* ------------------------------- Transitions ------------------------------- */
@@ -485,12 +785,18 @@ function goTo(next) {
   if (isAnimating || next === currentIndex) return;
   if (performance.now() < lockedUntil) return;
   isAnimating = true;
+  activeIndex = next;
 
   // Shortest path around the loop decides the slide direction
   const forward = (next - currentIndex + len) % len;
   const direction = forward <= len / 2 ? 1 : -1;
   const nextTexture = textures[blobs[next].config.map];
-  const FAR = halfW() + 3;
+  // Scroll strength: a hard scroll gives a bigger overshoot, a bigger swell and a longer settle
+  const energy = Math.min(scrollEnergy, 1.6);
+  nudgeDrift(DRIFT_SIGN * direction * (0.07 + energy * 0.07));
+  sound.sweep(direction, energy);
+  const settle = `back.out(${(0.5 + energy * 0.8).toFixed(2)})`; // incoming title overshoots, then floats back
+  const offscreen = (i, sign) => sign * (halfW() + widthOf(i) / 2 + 0.25);
 
   textUniforms.direction.value = direction;
 
@@ -498,8 +804,8 @@ function goTo(next) {
   material.uniforms.uGradientNext.value = nextTexture;
   gsap.to(material.uniforms.uGradientMix, { value: 1, duration: DURATION, ease: EASE });
 
-  // Every title glides one slot: previous <- current <- next. Titles entering the
-  // edge come in from off-screen, titles leaving slide out past the other side.
+  // Every title glides one slot: previous <- current <- next. The title arriving in the centre
+  // overshoots a little and settles, like something floating on water; the others drift softly.
   texts.forEach((t, i) => {
     const oldRel = relOf(i, currentIndex);
     const newRel = relOf(i, next);
@@ -510,18 +816,31 @@ function goTo(next) {
     const mat = t.material;
     if (!wasVisible) {
       t.visible = true;
-      t.position.x = direction * FAR;
+      t.position.x = offscreen(i, direction);
       mat.uniforms.uOpacity.value = 0;
     }
 
     const target = willShow ? slot(i, newRel, next) : null;
-    gsap.to(t.position, { x: target ? target.x : -direction * FAR, duration: DURATION, ease: EASE });
+    gsap.to(t.position, {
+      x: target ? target.x : offscreen(i, -direction),
+      duration: DURATION * 1.4,
+      ease: newRel === 0 ? settle : 'power3.out',
+      overwrite: 'auto',
+    });
     gsap.to(mat.uniforms.uOpacity, {
       value: !target || !target.show ? 0 : newRel === 0 ? 1 : GHOST,
       duration: DURATION,
       ease: EASE,
+      overwrite: 'auto',
     });
   });
+
+  // Water surface under the titles: swells up fast, then calms down slowly. The harder you
+  // scroll, the longer it takes to settle (and the bigger it gets, see the render loop).
+  gsap.killTweensOf(waveEnv);
+  gsap.timeline()
+    .to(waveEnv, { v: 1, duration: 0.35, ease: 'power2.out' })
+    .to(waveEnv, { v: 0, duration: 1.6 + energy * 0.8, ease: 'sine.inOut' });
 
   gsap.to(textUniforms.progress, {
     value: 0.5,
@@ -551,14 +870,28 @@ const step = (direction) => goTo((currentIndex + direction + blobs.length) % blo
 
 /* --------------------------------- Input ----------------------------------- */
 
+// Firefox reports wheel ticks in "lines" instead of pixels, so normalise first
+const wheelUnits = (e) => (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1);
+
 window.addEventListener('wheel', (e) => {
-  if (Math.abs(e.deltaY) < WHEEL_THRESHOLD) return;
-  step(Math.sign(e.deltaY));
+  // Left/right scrolling (trackpad swipe, shift + wheel) works like up/down scrolling
+  const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY);
+  const raw = (horizontal ? e.deltaX : e.deltaY) * wheelUnits(e);
+  const mag = Math.abs(raw);
+
+  addEnergy(mag / 250); // keeps feeding the ripples while a transition is running: scroll harder, get more water
+  if (horizontal) nudgeDrift(DRIFT_SIGN * Math.sign(raw) * Math.min(mag / 1500, 0.05)); // keeps pushing while you keep scrolling
+
+  if (mag < WHEEL_THRESHOLD) return;
+  step(Math.sign(raw));
 }, { passive: true });
 
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'ArrowDown' || e.key === 'ArrowRight') step(1);
-  if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') step(-1);
+  const next = e.key === 'ArrowDown' || e.key === 'ArrowRight';
+  const prev = e.key === 'ArrowUp' || e.key === 'ArrowLeft';
+  if (!next && !prev) return;
+  addEnergy(0.3);
+  step(next ? 1 : -1);
 });
 
 let touchX = 0;
@@ -566,12 +899,25 @@ let touchY = 0;
 window.addEventListener('touchstart', (e) => {
   touchX = e.touches[0].clientX;
   touchY = e.touches[0].clientY;
+  drift.dragging = true;
+  drift.hold = 0;
+}, { passive: true });
+window.addEventListener('touchmove', (e) => {
+  if (reduceMotion) return;
+  const dx = e.touches[0].clientX - touchX;
+  drift.hold = THREE.MathUtils.clamp(-DRIFT_SIGN * dx * 0.0012, -DRIFT_MAX, DRIFT_MAX); // follows the finger
 }, { passive: true });
 window.addEventListener('touchend', (e) => {
+  drift.dragging = false;
+  drift.target = drift.hold; // let go: it eases back from wherever the finger left it
+  drift.hold = 0;
   const dx = e.changedTouches[0].clientX - touchX;
   const dy = e.changedTouches[0].clientY - touchY;
   const d = Math.abs(dx) > Math.abs(dy) ? dx : dy;
-  if (Math.abs(d) > 40) step(d < 0 ? 1 : -1);
+  if (Math.abs(d) > 40) {
+    addEnergy(Math.min(Math.abs(d) / 200, 1.2)); // a long swipe = a strong scroll
+    step(d < 0 ? 1 : -1);
+  }
 }, { passive: true });
 
 window.addEventListener('resize', () => {
@@ -634,6 +980,10 @@ if (location.search.includes('debug')) {
     sceneFolder.add(renderer, 'toneMapping', maps).name('Tone mapping').onChange(() => { material.needsUpdate = true; });
     sceneFolder.add(renderer, 'toneMappingExposure', 0.3, 2, 0.01).name('Exposure');
 
+    const audioFolder = gui.addFolder('Sound');
+    audioFolder.add(SOUND, 'SWEEP_VOLUME', 0, 0.4, 0.001).name('Sweep volume');
+    audioFolder.add(SOUND, 'MASTER', 0, 1, 0.01).name('Master').onChange((v) => sound.setMaster(v));
+
     gui.add({
       copy() {
         const r = (n) => Math.round(n * 1000) / 1000;
@@ -668,8 +1018,30 @@ function animate() {
   const amp = reduceMotion ? 0 : 1;
   sphere.position.y = Math.sin(t * 0.8) * 0.045 * amp;
   sphere.scale.setScalar(baseScale * (1 + Math.sin(t * 0.55 + 1.2) * 0.012 * amp));
+  // Only the title in the centre breathes; the previous / next ones stay still. The weight eases
+  // between 0 and 1, so when the active title changes the float hands over smoothly.
   const titleY = Math.sin(t * 0.8 + 0.9) * 0.028 * amp;
-  texts.forEach((tx) => { if (tx.visible) tx.position.y = titleY; });
+  texts.forEach((tx, i) => {
+    if (!tx.visible) return;
+    breath[i] += ((i === activeIndex ? 1 : 0) - breath[i]) * (1 - Math.exp(-dt * 2.2));
+    tx.position.y = titleY * breath[i];
+  });
+
+  // Water under the titles: strength follows the transition envelope AND how hard you are
+  // scrolling right now. Direction is smoothed so reversing never makes the waves jump.
+  scrollEnergy *= Math.exp(-dt * 1.3);
+  waveDir += (textUniforms.direction.value - waveDir) * (1 - Math.exp(-dt * 3));
+  textUniforms.uPhase.value += dt * waveDir;
+  textUniforms.uWave.value = Math.min(waveEnv.v * (0.4 + scrollEnergy), 2.2);
+
+  // Horizontal float: a soft spring chases the drift target, and the target relaxes back to 0.
+  // The slight lag and overshoot is what makes it feel like floating rather than sliding.
+  drift.target *= Math.exp(-dt * 1.6);
+  const driftGoal = drift.dragging ? drift.hold : drift.target;
+  drift.vx += ((driftGoal - drift.x) * 14 - drift.vx * 5.5) * dt;
+  drift.x += drift.vx * dt;
+  sphere.position.x = drift.x;
+  sphere.rotation.z = THREE.MathUtils.clamp(-drift.vx * 0.18, -0.15, 0.15); // leans a touch into the move
 
   updateBadge(dt);
 
